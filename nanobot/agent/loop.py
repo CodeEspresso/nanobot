@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.history_filter import filter_session_history
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.model_router import ModelRouter
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -111,6 +113,10 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
         )
+        self.model_router = ModelRouter(
+            default_provider=provider,
+            default_model=self.model,
+        )
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -180,6 +186,37 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _compact_old_tool_results(messages: list[dict], keep_last: int = 2) -> None:
+        """Compress tool results from earlier iterations in-place.
+
+        Tool results that have already been processed by the LLM (i.e. followed
+        by an assistant message) are collapsed to a one-line summary, except for
+        the most recent `keep_last` tool-result groups which stay full.
+        """
+        from nanobot.agent.history_filter import _summarize_tool_result
+
+        # Find all tool-result indices
+        tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+        if len(tool_indices) <= keep_last:
+            return
+
+        # Only compact tool results that are followed by an assistant message
+        # (meaning the LLM already processed them)
+        last_assistant = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant = i
+                break
+
+        to_compact = tool_indices[:-keep_last]
+        for idx in to_compact:
+            if idx < last_assistant:
+                msg = messages[idx]
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > 300:
+                    messages[idx] = _summarize_tool_result(msg)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -194,12 +231,22 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # Compact old tool results before each LLM call to prevent
+            # token accumulation from multi-step tool use (e.g. chunked reads)
+            if iteration > 1:
+                self._compact_old_tool_results(messages)
+
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
+            # Select provider + model (may escalate on errors/loops)
+            active_provider, active_model = self.model_router.select(
+                response if iteration > 1 else None,
+            )
+
+            response = await active_provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
-                model=self.model,
+                model=active_model,
             )
 
             if response.has_tool_calls:
@@ -235,13 +282,21 @@ class AgentLoop:
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
-                    final_content = clean or "Sorry, I encountered an error calling the AI model."
-                    break
+                    if self.model_router.is_highest_tier or self.model_router._manually_set:
+                        tier = self.model_router.current_tier
+                        final_content = (
+                            f"模型 ({tier}) 返回错误: {(clean or '')[:200]}\n"
+                            "请检查模型状态或切换模型 (/model)"
+                        )
+                        break
+                    # Not at highest tier yet — let next iteration escalate
+                    continue
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
                 final_content = clean
+                self.model_router.notify_task_complete()
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -369,10 +424,13 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=0)
+            history = filter_session_history(session.get_history(max_messages=0))
+            # Subagent results should be assistant role, other system messages use user role
+            current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -406,10 +464,20 @@ class AgentLoop:
                 "/new — Start a new conversation",
                 "/stop — Stop the current task",
                 "/restart — Restart the bot",
+                "/model — Show/switch model tier",
                 "/help — Show available commands",
             ]
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
+            )
+        if cmd == "/model" or cmd.startswith("/model "):
+            arg = msg.content.strip()[6:].strip()
+            if arg:
+                result = self.model_router.set_tier(arg)
+            else:
+                result = self.model_router.get_status()
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=result,
             )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -418,7 +486,13 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=0)
+        raw_history = session.get_history(max_messages=0)
+        history = filter_session_history(raw_history)
+        raw_chars = sum(len(m.get("content", "") or "") for m in raw_history)
+        new_chars = sum(len(m.get("content", "") or "") for m in history)
+        print(f"[history_filter] {len(raw_history)} → {len(history)} msgs, {raw_chars} → {new_chars} chars", flush=True)
+        logger.info("History filter: {} → {} msgs, {} → {} chars",
+                    len(raw_history), len(history), raw_chars, new_chars)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
@@ -480,7 +554,9 @@ class AgentLoop:
                             continue  # Strip runtime context from multimodal messages
                         if (c.get("type") == "image_url"
                                 and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            filtered.append({"type": "text", "text": "[image]"})
+                            path = (c.get("_meta") or {}).get("path", "")
+                            placeholder = f"[image: {path}]" if path else "[image]"
+                            filtered.append({"type": "text", "text": placeholder})
                         else:
                             filtered.append(c)
                     if not filtered:

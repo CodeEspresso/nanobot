@@ -35,7 +35,12 @@ _SAVE_MEMORY_TOOL = [
                     "memory_update": {
                         "type": "string",
                         "description": "Full updated long-term memory as markdown. Include all existing "
-                        "facts plus new ones. Return unchanged if nothing new.",
+                        "facts plus new ones. Return unchanged if nothing new. "
+                        "IMPORTANT: Only include COMPLETED facts. DO NOT include: "
+                        "- Incomplete tasks (需要检查, 需要确认, TODO, etc.) "
+                        "- Questions pending investigation "
+                        "- Next steps or action items "
+                        "- Temporary debugging notes",
                     },
                 },
                 "required": ["history_entry", "memory_update"],
@@ -92,8 +97,60 @@ class MemoryStore:
         self.memory_file.write_text(content, encoding="utf-8")
 
     def append_history(self, entry: str) -> None:
+        """Append a history entry, merging with a recent duplicate if the topic matches."""
+        entry = entry.rstrip()
+        if not entry:
+            return
+
+        # Try to merge with recent entries that share the same topic.
+        if self.history_file.exists():
+            try:
+                text = self.history_file.read_text(encoding="utf-8")
+                paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+                new_topic = self._history_topic(entry)
+                if new_topic and paragraphs:
+                    # Check last 10 entries for a matching topic.
+                    merged = False
+                    for i in range(len(paragraphs) - 1, max(len(paragraphs) - 11, -1), -1):
+                        old_topic = self._history_topic(paragraphs[i])
+                        if old_topic and self._topic_similar(new_topic, old_topic):
+                            logger.debug(
+                                "History merge: replacing '{}' with '{}'",
+                                paragraphs[i][:60], entry[:60],
+                            )
+                            paragraphs[i] = entry
+                            merged = True
+                            break
+                    if merged:
+                        self.history_file.write_text(
+                            "\n\n".join(paragraphs) + "\n\n", encoding="utf-8",
+                        )
+                        return
+            except Exception:
+                pass  # Fall through to normal append.
+
         with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
+            f.write(entry + "\n\n")
+
+    @staticmethod
+    def _history_topic(entry: str) -> str:
+        """Extract the topic portion of a history entry (strip timestamp and result suffix)."""
+        import re
+        # Remove leading timestamp like [2026-03-20 14:00]
+        text = re.sub(r"^\[[\d\- :]+\]\s*", "", entry)
+        # Remove trailing result / tool stats (after first 。or ，使用工具)
+        text = re.split(r"[，。]使用工具", text)[0]
+        text = re.split(r"[，。]结果", text)[0]
+        return text.strip()
+
+    @staticmethod
+    def _topic_similar(a: str, b: str) -> bool:
+        """Check whether two history topics are about the same thing."""
+        from difflib import SequenceMatcher
+        if not a or not b:
+            return False
+        ratio = SequenceMatcher(None, a, b).ratio()
+        return ratio >= 0.6
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
@@ -188,6 +245,8 @@ class MemoryStore:
 
             self.append_history(entry)
             update = _ensure_text(update)
+            # Filter out task-like content before saving
+            update = self._filter_tasks_from_memory(update)
             if update != current_memory:
                 self.write_long_term(update)
 
@@ -217,6 +276,58 @@ class MemoryStore:
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
         )
+
+    def _filter_tasks_from_memory(self, content: str) -> str:
+        """
+        Filter out task-like content from MEMORY.md to prevent infinite loops.
+
+        Removes lines containing:
+        - 需要检查, 需要确认, TODO, etc.
+        - Unanswered questions
+        - Next steps / action items
+        """
+        if not content:
+            return content
+
+        lines = content.split('\n')
+        filtered = []
+
+        # Task markers
+        task_markers = [
+            '需要检查', '需要确认', '需要验证', '需要测试', '需要修复',
+            '待办', 'todo', 'fixme', 'xxx',
+            '接着做', '继续完成', '未完成', '下一步',
+        ]
+
+        for line in lines:
+            line_lower = line.lower()
+
+            # Keep section headers
+            if line.startswith('#'):
+                filtered.append(line)
+                continue
+
+            # Check if line contains task markers
+            if line.startswith('- '):
+                is_task = False
+                for marker in task_markers:
+                    if marker in line_lower:
+                        is_task = True
+                        break
+
+                # Check for question format
+                if not is_task and ('？' in line or '?' in line):
+                    question_words = ['是否', '有没有', '能不能', '会不会', '为什么', '怎么']
+                    if any(word in line_lower for word in question_words):
+                        is_task = True
+
+                if is_task:
+                    logger.debug("Filtered task line from memory: {}", line.strip())
+                    continue
+
+            filtered.append(line)
+
+        return '\n'.join(filtered)
 
 
 class MemoryConsolidator:

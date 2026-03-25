@@ -125,6 +125,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        current_role: str = "user",
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -140,7 +141,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},
             *history,
-            {"role": "user", "content": merged},
+            {"role": current_role, "content": merged},
         ]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
@@ -159,17 +160,28 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             if not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            images.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                "_meta": {"path": str(p)},
+            })
 
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
 
+    _TOOL_RESULT_MAX_CHARS = 8000  # ~2K tokens; prevents single tool call from bloating context
+
     def add_tool_result(
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: str,
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
+        """Add a tool result to the message list, truncating if too large."""
+        if isinstance(result, str) and len(result) > self._TOOL_RESULT_MAX_CHARS:
+            half = self._TOOL_RESULT_MAX_CHARS // 2
+            result = (result[:half]
+                      + f"\n... ({len(result) - self._TOOL_RESULT_MAX_CHARS} chars omitted)\n"
+                      + result[-half:])
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
         return messages
 

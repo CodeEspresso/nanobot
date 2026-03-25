@@ -23,3 +23,6 @@ botpy.log
 nano.*.save
 .DS_Store
 uv.lock
+*.json
+config.x8
+*.md
