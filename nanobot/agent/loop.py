@@ -221,12 +221,17 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        *,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        message_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        response = None  # Initialize to avoid "referenced before assignment"
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -239,9 +244,7 @@ class AgentLoop:
             tool_defs = self.tools.get_definitions()
 
             # Select provider + model (may escalate on errors/loops)
-            active_provider, active_model = self.model_router.select(
-                response if iteration > 1 else None,
-            )
+            active_provider, active_model = self.model_router.select(response)
 
             response = await active_provider.chat_with_retry(
                 messages=messages,
@@ -268,11 +271,27 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                for tc in response.tool_calls:
+                    tools_used.append(tc.name)
+                    args_str = json.dumps(tc.arguments, ensure_ascii=False)
+                    logger.info("Tool call: {}({})", tc.name, args_str[:200])
+
+                # Re-bind tool context right before execution so that
+                # concurrent sessions don't clobber each other's routing.
+                self._set_tool_context(channel, chat_id, message_id)
+
+                # Execute all tool calls concurrently — the LLM batches
+                # independent calls in a single response on purpose.
+                # return_exceptions=True ensures all results are collected
+                # even if one tool is cancelled or raises BaseException.
+                results = await asyncio.gather(*(
+                    self.tools.execute(tc.name, tc.arguments)
+                    for tc in response.tool_calls
+                ), return_exceptions=True)
+
+                for tool_call, result in zip(response.tool_calls, results):
+                    if isinstance(result, BaseException):
+                        result = f"Error: {type(result).__name__}: {result}"
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -432,7 +451,12 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                channel=channel,
+                chat_id=chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -509,7 +533,11 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            message_id=msg.metadata.get("message_id"),
         )
 
         if final_content is None:
